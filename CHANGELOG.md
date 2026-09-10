@@ -347,6 +347,20 @@ performance gap this fix does not address.
 ### Fixed — Cross-language codegen textured material round-trip
 
 `to_*_code()` now preserves both `applied_width` and material `opacity` when regenerating textured materials across all 5 language ports (Python, TypeScript, .NET, Dart, C++).
+### Fixed — TypeScript writer: face texture UV basis
+
+`uvMatrixForFace` fit a face's 3x3 UV-to-world matrix against the face's
+first-edge direction (a create.ts-local `faceUvBasis(points, normal)`), but
+every reader of that matrix - this package's own `readFtc` / scene builder,
+and real SketchUp - derives the same matrix's basis from the face NORMAL
+instead (`faceUvBasis(normal)`, exported from `model.ts`). The two bases
+only coincided when a flat face's first edge happened to already be +X;
+any other winding, or any non-flat (sloped) face, wrote a texture matrix
+against one basis and read it back against another, so `frontUv`/`backUv`
+positioning came back rotated or skewed in SketchUp. `uvMatrixForFace` now
+derives its basis from the normal the same way the reader does, and the
+now-unused first-edge-derived `faceUvBasis` helper in create.ts was
+removed. No public API change.
 
 ### Changed — TypeScript writer memory
 
