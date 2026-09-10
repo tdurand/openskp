@@ -52,6 +52,7 @@ import {
   LAYER_WRITER_BASE,
   SCAFFOLD_CLASS_SLOT,
 } from './scaffold';
+import { faceUvBasis as faceUvBasisFromNormal } from './model';
 
 // This package has no hard dependency on @types/node (it targets the
 // browser too), so - like index.ts's own SkpFile.open - Node-only globals
@@ -280,16 +281,6 @@ function resolveMatrix3x3(matrix3x3?: Matrix3x3, rotation?: Rotation): Matrix3x3
   return matrix3x3;
 }
 
-/** The in-plane 2D basis (U, W) real SketchUp uses to parameterize a
- * face's texture mapping: the face's own first edge direction
- * (points[1] - points[0], normalized) as U, and the plane normal crossed
- * with that as W. */
-function faceUvBasis(points: readonly Point3[], normal: Point3): [Point3, Point3] {
-  const u = normalize3([points[1][0] - points[0][0], points[1][1] - points[0][1], points[1][2] - points[0][2]]);
-  const w = normalize3(cross(normal, u));
-  return [u, w];
-}
-
 /** An arbitrary orthonormal in-plane basis (U, W) for a circle/arc's
  * plane, given only its normal. */
 function circleBasis(normal: Point3): [Point3, Point3] {
@@ -350,8 +341,18 @@ function solveUvMatrix(pairs: readonly UvPair[], basis: [Point3, Point3]): numbe
   return [a0, b0, 0.0, c0, d0, 0.0, e0, f0, 1.0];
 }
 
+/** `points` (the face's full corner list) is kept in the signature only to
+ * match `writeFace`'s call site, not used for the basis anymore: the
+ * texture's in-plane (U, W) basis must be derived from the face NORMAL
+ * (`faceUvBasis` from model.ts), the same basis the reader uses to turn a
+ * written `uvTransform` matrix back into UV (readFtc / face-groups.ts's own
+ * `faceUvBasis(fn)` call). Deriving it from the first edge direction
+ * instead (as this used to) fits a matrix against a different basis than
+ * the one it gets read back with, so any face whose first edge isn't +X,
+ * or that isn't flat, came back with rotated/skewed UVs. */
 function uvMatrixForFace(points: readonly Point3[], pairs: readonly UvPair[], normal: Point3): number[] {
-  return solveUvMatrix(pairs, faceUvBasis(points, normal));
+  const { xr, yr } = faceUvBasisFromNormal(normal);
+  return solveUvMatrix(pairs, [xr, yr]);
 }
 
 // ---------------------------------------------------------------------

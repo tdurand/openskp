@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — TypeScript writer: face texture UV basis
+
+`uvMatrixForFace` fit a face's 3x3 UV-to-world matrix against the face's
+first-edge direction (a create.ts-local `faceUvBasis(points, normal)`), but
+every reader of that matrix - this package's own `readFtc` / scene builder,
+and real SketchUp - derives the same matrix's basis from the face NORMAL
+instead (`faceUvBasis(normal)`, exported from `model.ts`). The two bases
+only coincided when a flat face's first edge happened to already be +X;
+any other winding, or any non-flat (sloped) face, wrote a texture matrix
+against one basis and read it back against another, so `frontUv`/`backUv`
+positioning came back rotated or skewed in SketchUp. `uvMatrixForFace` now
+derives its basis from the normal the same way the reader does, and the
+now-unused first-edge-derived `faceUvBasis` helper in create.ts was
+removed. No public API change.
+
 ### Changed — TypeScript writer memory
 
 `ArchiveWriter` keeps the archive in a growable `Uint8Array` instead of a
