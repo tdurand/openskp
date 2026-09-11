@@ -568,6 +568,48 @@ reading, just inverted. See
 [Write capabilities](docs/DEVELOPER_GUIDE.md#write-capabilities) in the
 Developer Guide for the full API and behavior.
 
+#### Model attribute dictionaries (TypeScript)
+
+Component definitions, instances, groups and faces take an `attributes`
+option. The **model itself** takes `addModelAttributeDict(name, entries)`,
+which is how SketchUp's native geolocation block is written: a dictionary
+named `GeoReference`, read by Model Info > Geo-location, the sun/shadow
+engine, Add Location and KMZ export.
+
+```ts
+const builder = create();
+builder.addModelAttributeDict('GeoReference', {
+  Latitude: 43.2965,              // degrees
+  Longitude: 5.3698,              // degrees
+  GeoReferenceNorthAngle: 358.37, // grid bearing of the model's +Y axis, clockwise from UTM grid north (see below)
+  ModelTranslationX: -27253168.08, // minus the UTM easting of the model origin, in INCHES
+  ModelTranslationY: -188837342.81,// minus the UTM northing of the model origin, in INCHES
+  ModelTranslationZ: 0,
+  LocationSource: 'Custom',       // free text; SketchUp itself writes e.g. "Google Earth"
+  UsesGeoReferencing: true,
+});
+builder.addFace([[0, 0, 0], [100, 0, 0], [100, 100, 0], [0, 100, 0]]);
+```
+
+`GeoReferenceNorthAngle` is not "true north is up" but the UTM grid bearing of the model's +Y axis, clockwise from grid north: SketchUp rotates the model by `360 - GeoReferenceNorthAngle` degrees counter-clockwise and then applies `ModelTranslation`. A model whose +Y points at true north therefore declares `360 - convergence`, where the grid convergence at the origin is `atan(tan(lon - lon0) * sin(lat))` for the zone's central meridian `lon0` (1.63 degrees at Marseille, 0.64 at New York). This was read off a file SketchUp itself geolocated (Add Location, New York): it declares 359.3608, exactly 360 minus the convergence there, and its 1,607 buildings match OpenStreetMap with a 3.5 m median only under this reading (11.5 m with no rotation, 16.7 m with the opposite sign). Writing 0 for a true-north model leaves it 1 to 2 degrees off the grid, tens of metres at the edge of a city block model.
+
+
+Values may be strings, numbers or booleans (a boolean is written as
+SketchUp's own 1-byte bool type and reads back as `1`/`0`). Call it
+**before** any material, layer, definition, group, face or instance call:
+the dictionaries go into the model's own attribute container, which sits
+immediately ahead of the material list, so they take slots those writers
+would already have handed out, and the builder throws rather than let
+that happen.
+
+That container is the model's own, not the first one in the file: a
+brand-new document carries a null pointer there, and writing
+`GeoReference` into any other container gives a file SketchUp opens and
+reports as "not geo-located".
+
+On the read side, `parseSkp()` surfaces the same block as
+`model.attributes.GeoReference` for legacy (pre-2021 MFC) files.
+
 ### Converting
 
 `parse()` and `buildScene()` are also the front half of a converter, not

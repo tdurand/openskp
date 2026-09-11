@@ -321,6 +321,11 @@ function parseToRaw(buffer: ArrayBuffer, options?: ParseOptions): ParsedRawData 
 
   return {
     version,
+    // Model-level attribute dictionaries are decoded for legacy (MFC)
+    // files only - the model's CAttributeContainer is a construct of that
+    // container. VFF files keep the same information somewhere in the TLV
+    // tree, not yet located, so they report none rather than guessing.
+    attributes: {},
     units,
     layerColors,
     layerHidden,

@@ -103,6 +103,31 @@ export const SCAFFOLD_SHA256 = '809a1ab73a20a192ab13aaff197afb1c67d0e9352f6a353a
  * list marker" a zero-material scaffold starts with. */
 export const MATERIAL_INSERT_POS = 3400;
 
+/** Absolute offset of the MODEL's own `CAttributeContainer` pointer -
+ * the 2-byte NULL object pointer (`00 00`) a model with no attribute
+ * dictionaries carries, and the place SketchUp's own `GeoReference`
+ * geolocation block has to go.
+ *
+ * How it was derived (from the reader's own anchor plus real files, not
+ * guessed): `legacy.ts`'s walk anchors on the material manager and reads
+ * the u32 material count at `MATERIAL_INSERT_POS - 4` (3396). Between
+ * that count and the model's attribute-container pointer sits a 14-byte
+ * model-record trailer - `00 00 00 00 01 01` then eight zero bytes -
+ * which is byte-identical in all four `.skp` files this package bundles
+ * (`blank_v17`, `single_material_v17`, and the two real, SketchUp-written
+ * geolocated fixtures `capilla_quiroz_v17` and `gondola_v20`). The two
+ * bytes before that trailer are the pointer: in both real files a live
+ * class-ref (`05 80` + a `00 00 00` preamble) to a container holding
+ * `GeoReference`, `GSU_ContributorsInfo` and `temp` dictionaries; in this
+ * scaffold, `00 00` - a model with no dictionaries at all.
+ *
+ * Since the container is written where the null pointer is, i.e. just
+ * ahead of the material list, its objects take the slots the materials
+ * would otherwise have started at (`BASE`), and every later slot shifts
+ * by exactly what `SkpBuilder`'s existing material shift already
+ * accounts for. Nothing else in the scaffold moves relative to it. */
+export const MODEL_ATTR_NULL_POS = 3380;
+
 /** The archive slot new material/layer/definition/geometry writers start
  * allocating from - the scaffold's own `CLayer` class declaration slot. */
 export const BASE = 9;
