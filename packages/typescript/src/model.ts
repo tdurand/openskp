@@ -17,6 +17,35 @@ export type ModelAttributeValue = string | number | Array<string | number | null
  * attribute key - e.g. `attributes.GeoReference.Latitude`. */
 export type ModelAttributes = Record<string, Record<string, ModelAttributeValue>>;
 
+/** The model's own location as its `ShadowInfo` record carries it - the
+ * record Model Info > Geo-location displays and the sun/shadow engine
+ * casts from.
+ *
+ * This is a SECOND, independent copy of the location: the `GeoReference`
+ * attribute dictionary (see `SkpModel.attributes`) is what makes a file
+ * count as "accurately geo-located", but it is not what the dialog shows
+ * or what the shadows follow. The two really can disagree - both real
+ * fixtures this package bundles were re-geolocated to Boulder with Set
+ * Manual Location, and their `ShadowInfo` still names the city the model
+ * was authored in. A writer that sets one and not the other produces
+ * exactly that split, which is why `SkpBuilder` has both
+ * `addModelAttributeDict` and `setShadowInfoLocation`. */
+export interface ShadowInfo {
+  /** City label, as typed into Model Info > Geo-location. `""` when the
+   * record carries no city (what `setShadowInfoLocation` writes by
+   * default). */
+  city: string;
+  /** Country label, same field group as `city`. */
+  country: string;
+  /** Degrees east, negative west. */
+  longitude: number;
+  /** Degrees north, negative south. */
+  latitude: number;
+  /** UTC offset in HOURS at standard (non-daylight-saving) time - e.g. 1
+   * for Paris, -7 for Boulder. */
+  tzOffsetHours: number;
+}
+
 export interface SkpModel {
   version: string;
   definitions: Map<number, Definition>;
@@ -31,6 +60,16 @@ export interface SkpModel {
    * information elsewhere in the TLV tree and are not decoded for it
    * yet, so they always report `{}`. */
   attributes: ModelAttributes;
+  /** The location the model's `ShadowInfo` record carries - what Model
+   * Info > Geo-location shows and what the sun/shadow engine uses. `null`
+   * when the file has no readable record.
+   *
+   * Legacy (pre-2021 MFC) files only: modern VFF files store the same
+   * information elsewhere in the TLV tree and are not decoded for it yet,
+   * so they always report `null`.
+   *
+   * NOT the same thing as `attributes.GeoReference` - see `ShadowInfo`. */
+  shadowInfo: ShadowInfo | null;
   /** The implicit top-level model definition: its `instances` are the
    * entities placed directly in the model (not inside any component/
    * group), and its `vertices`/`edges`/`faces` are geometry drawn directly
@@ -446,6 +485,9 @@ export interface ParsedRawData {
   /** Model-level attribute dictionaries - see `SkpModel.attributes`.
    * `{}` for VFF files, which are not decoded for them yet. */
   attributes: ModelAttributes;
+  /** The model's `ShadowInfo` location - see `SkpModel.shadowInfo`.
+   * `null` for VFF files, which are not decoded for it yet. */
+  shadowInfo: ShadowInfo | null;
   /** The model's unit-system string (e.g. "Millimeter"), read from
    * meta/meta.dat. null for legacy files or when the tag isn't found. */
   units: string | null;
@@ -465,6 +507,7 @@ export function buildModelFromParsed(parsed: ParsedRawData): SkpModel {
   const {
     version,
     attributes,
+    shadowInfo,
     units,
     layerColors,
     layerHidden,
@@ -540,6 +583,7 @@ export function buildModelFromParsed(parsed: ParsedRawData): SkpModel {
   return {
     version,
     attributes,
+    shadowInfo,
     definitions: finalDefinitions,
     // The implicit top-level model definition: its instances are the
     // entities placed directly in the model (not inside any component/
