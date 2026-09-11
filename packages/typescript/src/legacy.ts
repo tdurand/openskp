@@ -18,7 +18,7 @@
 import { GeometryBuilderFace, GeometryBuilderInstance, ParsedDefinition } from './geometry';
 import { EdgeFlagStore } from './edge-flags';
 import { DefaultVertexStore, type VertexStore } from './vertex-store';
-import { Material, Texture, ParsedRawData } from './model';
+import { Material, Texture, ParsedRawData, ModelAttributes, ModelAttributeValue } from './model';
 import { SkpParseError } from './errors';
 import { ParseOptions, PROGRESS_INTERVAL, emitLog, emitProgress } from './observability';
 
@@ -1421,6 +1421,106 @@ const CLAYER_PATTERN: (number | null)[] = [
   ...asciiBytes('CLayer'),
 ];
 
+/** Bytes between the model's own `CAttributeContainer` pointer and the
+ * u32 material count that follows it - an undecoded tail of the model
+ * record (`00 00 00 00 01 01` then eight zero bytes). Byte-identical in
+ * every legacy file this package bundles, v17 and v20, SDK-written and
+ * SketchUp-written alike; see `scaffold.ts`'s `MODEL_ATTR_NULL_POS`,
+ * which pins the write side of the same layout. */
+const MODEL_RECORD_TRAILER_LEN = 14;
+
+/** How far back from the container's end `readModelAttributes` is willing
+ * to look for its start. Real containers are a few hundred bytes; this is
+ * a bound on a best-effort backwards scan, not a format limit. */
+const MAX_MODEL_ATTR_CONTAINER_BYTES = 1 << 20;
+
+/** Flatten `readAttrContainer`'s `{ k: 'attrs', children }` shape into
+ * the public `{ dictName: { key: value } }` map. */
+function attrContainerToMap(attrs: any): ModelAttributes {
+  const out: ModelAttributes = {};
+  if (!attrs || typeof attrs !== 'object') return out;
+  for (const [, value] of attrs.children || []) {
+    // Each child tuple's first element is the entity CLASS NAME
+    // ('CAttributeNamed'); the dictionary's own declared name lives in
+    // value.name - the same distinction extractLegacyDynamicProperties
+    // documents.
+    if (!value || typeof value !== 'object' || value.k !== 'dict') continue;
+    const entries: Record<string, ModelAttributeValue> = {};
+    for (const [k, v] of Object.entries(value.entries || {})) {
+      entries[k] = v as ModelAttributeValue;
+    }
+    out[String(value.name ?? '')] = entries;
+  }
+  return out;
+}
+
+/**
+ * Decode the MODEL's own attribute dictionaries - SketchUp's
+ * `GeoReference` (Model Info > Geo-location) and `GSU_ContributorsInfo`
+ * blocks.
+ *
+ * **Where the container is.** The model record sits ahead of the material
+ * manager and is otherwise undecoded, but its last field before the
+ * material count is its `CAttributeContainer` pointer: the container ends
+ * exactly `MODEL_RECORD_TRAILER_LEN` bytes before `matCountPos`, the same
+ * material-count position `walk()` anchors on. A model with no
+ * dictionaries has a null pointer (`00 00`) there instead - which is
+ * indistinguishable, read backwards, from a real container's own
+ * children-list terminator, so the start is found by scanning back for a
+ * container class-ref that decodes and lands EXACTLY on that end.
+ *
+ * Do not anchor this on the first `CAttributeContainer` class
+ * declaration in the stream: that belongs to whichever record first used
+ * one (a component definition's `Name`/`Description`/`IsClassified`
+ * properties in real files), not to the model, and reading it makes
+ * SketchUp report a geolocated file as "not geo-located".
+ *
+ * Read separately from `walk()` rather than as part of it: the walk
+ * starts AT the material manager and derives its absolute slot base from
+ * that anchor, so it cannot be rewound over the model record. The
+ * throwaway archive used here parks its slot base high enough that every
+ * back-reference inside the container classifies as `premodel` instead of
+ * failing - a container holds only `CAttributeNamed` children, so it
+ * never needs a real base.
+ *
+ * Best-effort: a file whose container does not decode (an era whose
+ * preamble or trailer shape differs, a truncated record) reports no
+ * attributes rather than failing the whole parse, which would trade a
+ * working geometry read for metadata almost no caller asks for.
+ */
+function readModelAttributes(data: Uint8Array, ver: number, matCountPos: number): ModelAttributes {
+  const end = matCountPos - MODEL_RECORD_TRAILER_LEN;
+  // The smallest possible container is a class-ref (2) + its preamble (3)
+  // + an empty children list (2).
+  if (end < 7) return {};
+  const floor = Math.max(0, end - MAX_MODEL_ATTR_CONTAINER_BYTES);
+  let found: ModelAttributes | null = null;
+  for (let pos = end - 7; pos >= floor; pos--) {
+    // Cheap shape filter before attempting a read: a class-ref tag's high
+    // byte carries the 0x80 marker, and the container's own preamble is
+    // three zero bytes (null attrs + empty pid mask).
+    if ((data[pos + 1] & 0x80) === 0) continue;
+    if (data[pos + 2] !== 0 || data[pos + 3] !== 0 || data[pos + 4] !== 0) continue;
+    try {
+      const ar = new Archive(data, ver);
+      Object.assign(ar.readers, READERS);
+      ar.nextSlot = 1 << 20;
+      ar.walkBase = 1 << 20;
+      ar.r.pos = pos;
+      const [, , value] = ar.readObject(ar.r, 'CAttributeContainer');
+      if (ar.r.pos !== end) continue;
+      // Keep scanning: a suffix of the real container can itself decode
+      // as a shorter container ending in the same place, so the match
+      // that starts earliest is the model's own.
+      found = attrContainerToMap(value);
+    } catch (e) {
+      if (e instanceof LegacyParseError || e instanceof RangeError) continue;
+      throw e;
+    }
+  }
+  return found ?? {};
+}
+
 function findVersionMajor(data: Uint8Array): number | null {
   const head = data.subarray(0, Math.min(0x60, data.length));
   // strip all 0x00 bytes (UTF-16LE ASCII text becomes plain ASCII-like)
@@ -1439,6 +1539,12 @@ interface WalkResult {
   root: [number, string | null, any][];
   layers: [number, any][];
   materials: [number, any][];
+  /** The file's major version, and the absolute offset of the u32
+   * material count the walk anchored on - both needed by
+   * `readModelAttributes`, which reads the model record that sits just
+   * ahead of that anchor. */
+  ver: number;
+  matCountPos: number;
 }
 
 /** Bootstrap the absolute slot base: parse material 1 with a throwaway
@@ -1632,7 +1738,10 @@ function walkModel(data: Uint8Array, ver: number, start: number, matCount: numbe
   }
   const root = readEntityList(ar, r, rootCount, 'root');
 
-  return { ar, root, layers, materials };
+  // matCountPos: the count is always the 4 bytes right before the
+  // anchor, whether that anchor is the first CMaterial record or (for a
+  // zero-material file) the layer-list marker.
+  return { ar, root, layers, materials, ver, matCountPos: start - 4 };
 }
 
 // ── adapter to the shared ParsedRawData shape ───────────────────────────
@@ -1822,6 +1931,8 @@ export function parseLegacyToRaw(data: Uint8Array, options?: ParseOptions): Pars
     throw e;
   }
 
+  const attributes = readModelAttributes(data, walkResult.ver, walkResult.matCountPos);
+
   const { ar, root, layers, materials } = walkResult;
   const slots = ar.slots;
   emitLog(options, 'debug', `Legacy walk complete: ${materials.length} materials, ${layers.length} layers`);
@@ -1945,6 +2056,7 @@ export function parseLegacyToRaw(data: Uint8Array, options?: ParseOptions): Pars
 
   return {
     version,
+    attributes,
     // Legacy (pre-2021 MFC) files carry no meta/meta.dat container -
     // that's a VFF/ZIP-only construct - so there is no known source for
     // the model's unit-system string here.

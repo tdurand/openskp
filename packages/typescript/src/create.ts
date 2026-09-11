@@ -21,7 +21,9 @@
  * independently per side) instead of the default planar projection, on a
  * face of any orientation. Component definitions, instances, and faces
  * can carry custom key/value metadata (the same mechanism SketchUp's own
- * "dynamic component" attributes use). Circular faces (`addCircle`) and
+ * "dynamic component" attributes use), and so can the MODEL itself
+ * (`addModelAttributeDict`, which is how SketchUp's native `GeoReference`
+ * geolocation block is written). Circular faces (`addCircle`) and
  * partial arcs (`addArc`) are genuine `CArcCurve` entities, and freeform
  * polylines (`addPolyline`) are genuine `CCurve` entities. Faces support
  * one or more holes. `autoTriangulate` fan-splits a non-planar polygon
@@ -39,6 +41,7 @@
 import {
   loadScaffold,
   MATERIAL_INSERT_POS,
+  MODEL_ATTR_NULL_POS,
   BASE,
   LAYER_COUNT_POS,
   ORIG_LAYER_COUNT,
@@ -81,8 +84,14 @@ export interface Rotation {
  * runtime-visible int/float distinction the way Python does, so unlike
  * Python's writer (which raises for an out-of-range `int` rather than
  * silently widening it) this widens instead - a deliberate, documented
- * judgment call. */
-export type AttributeValue = string | number;
+ * judgment call.
+ *
+ * A boolean is stored as SketchUp's own 1-byte bool type (0x07) - the
+ * type real SketchUp writes for `UsesGeoReferencing` and for the
+ * scaffold's own `IsClassified`/`IsDynamic`/`IsLive`. This project's
+ * reader decodes 0x07 as the NUMBER 1 or 0, not as a boolean, so a
+ * boolean written here round-trips as 1/0. */
+export type AttributeValue = string | number | boolean;
 export type AttributeDict = Record<string, AttributeValue>;
 
 /** Raised when a `.skp` file cannot be constructed. */
@@ -212,6 +221,11 @@ const ATTRIBUTE_NAMED_SLOT = 5;
 
 const ATTR_TYPE_INT32 = 0x04;
 const ATTR_TYPE_DOUBLE = 0x06;
+/** SketchUp's 1-byte bool - what real files carry for the model's own
+ * `IsClassified`/`IsDynamic`/`IsLive` and for GeoReference's
+ * `UsesGeoReferencing`. legacy.ts's reader decodes it as a u8 (1/0), not
+ * as a JS boolean. */
+const ATTR_TYPE_BOOL = 0x07;
 const ATTR_TYPE_STRING = 0x0a;
 
 /** The 176 bytes (everything after CCamera's 2-byte class-ref tag) real
@@ -531,6 +545,22 @@ interface CurveParams {
   numSegments: number;
 }
 
+/** The one place attribute values are type-checked, shared by
+ * `ArchiveWriter.writeAttributeDict` (which calls it through the method
+ * of the same name) and by `SkpBuilder.addModelAttributeDict`, which has
+ * to validate at call time - the model dictionaries it collects are not
+ * written until `toBytes()`, far too late for the caller to tell which
+ * call was the bad one. */
+function validateAttributeEntries(entries: AttributeDict): void {
+  for (const [key, value] of Object.entries(entries)) {
+    if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') {
+      throw new SkpWriteError(
+        `attribute ${JSON.stringify(key)}: unsupported value type (only str, number and bool are supported)`
+      );
+    }
+  }
+}
+
 /** Write-side mirror of legacy.ts's archive slot/class-ref bookkeeping -
  * emits the same MFC CArchive tag protocol (0xFFFF new-class,
  * 0x8000|slot short class-ref, plain u16 back-ref) that legacy.ts
@@ -698,14 +728,7 @@ class ArchiveWriter {
    * can check every attribute dict a multi-part write will need BEFORE
    * that write starts mutating this.bytes. */
   validateAttributeEntries(entries: AttributeDict): void {
-    for (const [key, value] of Object.entries(entries)) {
-      if (typeof value === 'boolean') {
-        throw new SkpWriteError(`attribute ${JSON.stringify(key)}: bool is not a supported value type - use 0/1 instead`);
-      }
-      if (typeof value !== 'string' && typeof value !== 'number') {
-        throw new SkpWriteError(`attribute ${JSON.stringify(key)}: unsupported value type (only str and number are supported)`);
-      }
-    }
+    validateAttributeEntries(entries);
   }
 
   writeAttributeDict(dictName: string, entries: AttributeDict): void {
@@ -723,6 +746,9 @@ class ArchiveWriter {
       if (typeof value === 'string') {
         this.pushU8(ATTR_TYPE_STRING);
         this.writeStr(value);
+      } else if (typeof value === 'boolean') {
+        this.pushU8(ATTR_TYPE_BOOL);
+        this.pushU8(value ? 1 : 0);
       } else if (Number.isInteger(value) && value >= -(2 ** 31) && value < 2 ** 31) {
         this.pushU8(ATTR_TYPE_INT32);
         this.pushI32(value);
@@ -733,6 +759,29 @@ class ArchiveWriter {
     }
     this.writeStr(''); // empty-key terminator
     this.pushU32(0); // ground truth: read and discarded by legacy.ts's reader too
+  }
+
+  /**
+   * Write the MODEL's own `CAttributeContainer` - the one the scaffold
+   * carries as a null pointer at `MODEL_ATTR_NULL_POS`, right before the
+   * material count. Byte-for-byte the shape real SketchUp writes there
+   * (see `scaffold.ts`'s `MODEL_ATTR_NULL_POS` for the two real files it
+   * was read off): a class-ref to the already-declared
+   * `CAttributeContainer`, its own 3-byte preamble (null attrs + empty
+   * pid mask), one `CAttributeNamed` child per dictionary, then the
+   * children-list terminator.
+   *
+   * Costs `1 + dicts.length` archive slots: one for the container, one
+   * per dictionary.
+   */
+  writeModelAttributeContainer(dicts: ReadonlyArray<[string, AttributeDict]>): void {
+    this.pushU16(0x8000 | ATTR_CONTAINER_SLOT);
+    this.alloc(); // a class-ref always allocates an object slot
+    this.pushZeros(3); // null attrs (2) + mask=0 (1)
+    for (const [dictName, entries] of dicts) {
+      this.writeAttributeDict(dictName, entries);
+    }
+    this.pushU16(0); // children-list terminator
   }
 
   /** Write one CFaceTextureCoords record. `frontMatrix`/`backMatrix` are
@@ -1860,6 +1909,9 @@ export class SkpBuilder {
   private tailPos = TAIL_POS;
   private scaffoldNextSlot = SCAFFOLD_NEXT_SLOT;
   private scaffoldClassSlot: Record<string, number> = { ...SCAFFOLD_CLASS_SLOT };
+  /** Model-level attribute dictionaries, in call order - written as the
+   * model's own `CAttributeContainer` by `toBytes()`. */
+  private modelAttributeDicts: Array<[string, AttributeDict]> = [];
 
   private materialWriter: ArchiveWriter;
   /** Every material registered so far, by name - populated by
@@ -1891,6 +1943,70 @@ export class SkpBuilder {
     // Materials always start allocating at `base`, the same slot the
     // (possibly absent) material section would have occupied.
     this.materialWriter = new ArchiveWriter(this.base, {});
+  }
+
+  /**
+   * Attach a named attribute dictionary to the MODEL itself, rather than
+   * to a component definition, instance, group or face (which take their
+   * own `attributes` option). This is how SketchUp stores its native
+   * geolocation block: a dictionary named `GeoReference`, which Model
+   * Info > Geo-location, the sun/shadow engine, Add Location and KMZ
+   * export all read.
+   *
+   * ```ts
+   * builder.addModelAttributeDict('GeoReference', {
+   *   Latitude: 43.2965,
+   *   Longitude: 5.3698,
+   *   GeoReferenceNorthAngle: 0,
+   *   // minus the UTM easting/northing of the model origin, in INCHES
+   *   ModelTranslationX: -27_918_461.5,
+   *   ModelTranslationY: -189_249_637.2,
+   *   ModelTranslationZ: 0,
+   *   LocationSource: 'Custom',
+   *   UsesGeoReferencing: true,
+   * });
+   * ```
+   *
+   * Must be called BEFORE any material, layer, component definition,
+   * group, face or instance call: the container is written just ahead of
+   * the material list, so its objects take the first slots the material
+   * writer would otherwise have handed out.
+   */
+  addModelAttributeDict(dictName: string, entries: AttributeDict): void {
+    if (
+      this.materialWriter.length > 0 ||
+      this.layerWriter !== null ||
+      this.definitionWriterInstance !== null ||
+      this.geometryWriter !== null
+    ) {
+      throw new SkpWriteError(
+        'addModelAttributeDict must be called before any addMaterial/addTextureMaterial/addLayer/' +
+          'addComponentDefinition/addGroup/addFace/addInstance call - the model attribute container is ' +
+          'written ahead of every object those writers allocate, so adding one now would renumber slots ' +
+          'they have already referenced'
+      );
+    }
+    if (this.modelAttributeDicts.some(([n]) => n === dictName)) {
+      throw new SkpWriteError(`model attribute dictionary ${JSON.stringify(dictName)} was already added`);
+    }
+    // Validated here rather than at toBytes() time: these entries are not
+    // written until then, and an error raised there could not say which
+    // call produced the bad value.
+    validateAttributeEntries(entries);
+
+    // Slot accounting, and the whole reason for the ordering rule above.
+    // The container and its dictionaries are written immediately before
+    // the material count, so they take the first slots at `base` and the
+    // materials start after them. Booking them onto the still-empty
+    // material writer means `materialShift` (its nextSlot minus `base`)
+    // covers them for free at every site that already applies it: the
+    // scaffold class-slot map, the layer/definition/geometry writers'
+    // starting slots, the active-layer anchor and the tail refs.
+    if (this.modelAttributeDicts.length === 0) {
+      this.materialWriter.nextSlot += 1; // the container's own object slot
+    }
+    this.materialWriter.nextSlot += 1; // this dictionary's
+    this.modelAttributeDicts.push([dictName, { ...entries }]);
   }
 
   addMaterial(name: string, rgba: readonly number[], opacity?: number): number {
@@ -2406,13 +2522,53 @@ export class SkpBuilder {
     const layerPids = this.layerWriter ? this.layerWriter.nextPid - 1 : 0;
     const pidDelta = this.materialCount + layerPids;
 
-    const prefix = Array.from(this.data.subarray(0, this.materialInsertPos - 4));
+    let prefix = Array.from(this.data.subarray(0, this.materialInsertPos - 4));
     if (pidDelta) {
       const u16 = readU16(prefix, PID_COUNTER_POS);
       writeU16At(prefix, PID_COUNTER_POS, u16 + pidDelta);
     }
     for (let i = 0; i < ISO_CAMERA_PREFIX_PATCH.length; i++) {
       prefix[ISO_CAMERA_PREFIX_OFFSET + i] = ISO_CAMERA_PREFIX_PATCH[i];
+    }
+    // The model's own attribute container goes last, AFTER both patches
+    // above: PID_COUNTER_POS (1987) and ISO_CAMERA_PREFIX_OFFSET (2993)
+    // both sit before MODEL_ATTR_NULL_POS (3380), so patching first keeps
+    // both offsets meaning what they were derived against - the
+    // untouched scaffold's own byte layout.
+    if (this.modelAttributeDicts.length > 0) {
+      if (prefix[MODEL_ATTR_NULL_POS] !== 0 || prefix[MODEL_ATTR_NULL_POS + 1] !== 0) {
+        throw new SkpWriteError(
+          `scaffold does not carry a null model attribute-container pointer at byte ${MODEL_ATTR_NULL_POS} - ` +
+            'MODEL_ATTR_NULL_POS must be re-derived before model attribute dictionaries can be written ' +
+            "(see scaffold.ts's own docstring)"
+        );
+      }
+      // A throwaway writer whose only job is to produce the container's
+      // bytes. Its starting slot is the container's own - the same slot
+      // the material writer was advanced past in addModelAttributeDict -
+      // so the check below is a real cross-check of that bookkeeping, not
+      // a restatement of it. Nothing else about this writer matters: it
+      // declares no class and writes no thumbnail, so classSlot is never
+      // read.
+      const containerWriter = new ArchiveWriter(this.base, {});
+      containerWriter.writeModelAttributeContainer(this.modelAttributeDicts);
+      const expectedNextSlot = this.base + 1 + this.modelAttributeDicts.length;
+      if (containerWriter.nextSlot !== expectedNextSlot) {
+        throw new SkpWriteError(
+          'internal: the model attribute container did not cost one archive slot plus one per dictionary - ' +
+            'the slots addModelAttributeDict booked onto the material writer are wrong'
+        );
+      }
+      const containerBytes = containerWriter.bytes.view();
+      // Built by appending rather than Array.prototype.splice with a
+      // spread: a long string value can make containerBytes large enough
+      // that spreading it as arguments overflows the call stack. The two
+      // null-pointer bytes are REPLACED, not kept - the container is that
+      // pointer, made real.
+      const spliced = prefix.slice(0, MODEL_ATTR_NULL_POS);
+      for (let i = 0; i < containerBytes.length; i++) spliced.push(containerBytes[i]);
+      for (let i = MODEL_ATTR_NULL_POS + 2; i < prefix.length; i++) spliced.push(prefix[i]);
+      prefix = spliced;
     }
     out.push(prefix);
     out.push(u32Bytes(this.materialCount));
@@ -2429,7 +2585,8 @@ export class SkpBuilder {
 
     // layerInsertPos -> defCountPos: just the active-layer anchor, which
     // needs +materialShift (never +layerShift - Layer0 itself never moves
-    // just because more layers are appended after it).
+    // just because more layers are appended after it). The model
+    // attribute container's own slots are already part of materialShift.
     const middle2a = Array.from(this.data.subarray(this.layerInsertPos, this.defCountPos));
     if (materialShift) shiftRef(middle2a, ACTIVE_LAYER_ANCHOR_REL, materialShift);
     out.push(middle2a);

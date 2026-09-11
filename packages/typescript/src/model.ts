@@ -5,9 +5,32 @@ import { SkpParseError } from './errors';
 import { ParseOptions, PROGRESS_INTERVAL, emitLog, emitProgress } from './observability';
 import { RawPage, RawDimension } from './pages-dimensions';
 
+/** One value inside a model-level attribute dictionary, as the legacy
+ * reader decodes it. Note that SketchUp's 1-byte bool type (0x07) comes
+ * back as the NUMBER 1 or 0, not as a boolean - including for values the
+ * writer's `addModelAttributeDict` was handed as `true`/`false`. Arrays
+ * and 3D points come back as number arrays, and an explicitly-null value
+ * as `null`. */
+export type ModelAttributeValue = string | number | Array<string | number | null> | null;
+
+/** Model-level attribute dictionaries, keyed by dictionary name then by
+ * attribute key - e.g. `attributes.GeoReference.Latitude`. */
+export type ModelAttributes = Record<string, Record<string, ModelAttributeValue>>;
+
 export interface SkpModel {
   version: string;
   definitions: Map<number, Definition>;
+  /** Attribute dictionaries attached to the MODEL itself rather than to
+   * any entity - SketchUp's own `GeoReference` (Model Info >
+   * Geo-location) and `GSU_ContributorsInfo` blocks live here. A model
+   * that has none reports `{}`; a component definition's own
+   * `Name`/`Description`/`IsClassified` properties are NOT these, they
+   * belong to that definition.
+   *
+   * Legacy (pre-2021 MFC) files only: modern VFF files store the same
+   * information elsewhere in the TLV tree and are not decoded for it
+   * yet, so they always report `{}`. */
+  attributes: ModelAttributes;
   /** The implicit top-level model definition: its `instances` are the
    * entities placed directly in the model (not inside any component/
    * group), and its `vertices`/`edges`/`faces` are geometry drawn directly
@@ -476,6 +499,9 @@ export interface SceneTexture {
  * primitive building, which both formats share. */
 export interface ParsedRawData {
   version: string;
+  /** Model-level attribute dictionaries - see `SkpModel.attributes`.
+   * `{}` for VFF files, which are not decoded for them yet. */
+  attributes: ModelAttributes;
   /** The model's unit-system string (e.g. "Millimeter"), read from
    * meta/meta.dat. null for legacy files or when the tag isn't found. */
   units: string | null;
@@ -494,6 +520,7 @@ export interface ParsedRawData {
 export function buildModelFromParsed(parsed: ParsedRawData): SkpModel {
   const {
     version,
+    attributes,
     units,
     layerColors,
     layerHidden,
@@ -568,6 +595,7 @@ export function buildModelFromParsed(parsed: ParsedRawData): SkpModel {
 
   return {
     version,
+    attributes,
     definitions: finalDefinitions,
     // The implicit top-level model definition: its instances are the
     // entities placed directly in the model (not inside any component/
