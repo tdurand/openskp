@@ -629,6 +629,51 @@ reports as "not geo-located".
 On the read side, `parseSkp()` surfaces the same block as
 `model.attributes.GeoReference` for legacy (pre-2021 MFC) files.
 
+#### Geolocating a file (TypeScript)
+
+A geolocated `.skp` carries its location **twice**, in two unrelated
+records, and needs both. `GeoReference` above is what makes SketchUp
+report the file as accurately geo-located; it is not what Model Info >
+Geo-location displays or what the sun and shadow engine casts from. Those
+come from the model's `ShadowInfo` record, which a brand-new document
+fills with SketchUp's own default, Boulder, Colorado. Set only the
+dictionary and the file opens geo-located while still showing, and shading
+for, Boulder. So set both:
+
+```ts
+const builder = create();
+builder.addModelAttributeDict('GeoReference', {
+  Latitude: 43.2965,
+  Longitude: 5.3698,
+  GeoReferenceNorthAngle: 0,
+  ModelTranslationX: -27253168.08,
+  ModelTranslationY: -188837342.81,
+  ModelTranslationZ: 0,
+  LocationSource: 'Custom',
+  UsesGeoReferencing: true,
+});
+builder.setShadowInfoLocation({
+  city: 'Marseille',              // optional, defaults to ""
+  country: 'France',              // optional, defaults to ""
+  longitude: 5.3698,              // degrees east
+  latitude: 43.2965,              // degrees north
+  tzOffsetHours: 1,               // UTC offset in HOURS, standard time; defaults to 0
+});
+builder.addFace([[0, 0, 0], [100, 0, 0], [100, 100, 0], [0, 100, 0]]);
+```
+
+Unlike `addModelAttributeDict`, `setShadowInfoLocation` may be called at
+any point before `toBytes()` and calling it again replaces the previous
+value: the record lives in the document tail and costs no archive slots.
+Never calling it leaves the tail exactly as the scaffold has it.
+
+On the read side, `parseSkp()` surfaces the record as `model.shadowInfo`
+(`{ city, country, longitude, latitude, tzOffsetHours }`, or `null`) for
+legacy files. The two really can disagree in files real SketchUp wrote:
+both real fixtures this project bundles were re-geolocated to Boulder with
+Set Manual Location, and their `ShadowInfo` still names the city each
+model was authored in.
+
 ### Converting
 
 `parse()` and `buildScene()` are also the front half of a converter, not

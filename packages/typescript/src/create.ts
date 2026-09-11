@@ -51,6 +51,12 @@ import {
   ROOT_COUNT_POS,
   ORIG_ROOT_COUNT,
   TAIL_POS,
+  SHADOW_INFO_CITY_POS,
+  SHADOW_INFO_CITY_DEFAULT,
+  SHADOW_INFO_COUNTRY_DEFAULT,
+  SHADOW_INFO_LONGITUDE_DEFAULT,
+  SHADOW_INFO_LATITUDE_DEFAULT,
+  SHADOW_INFO_TZ_OFFSET_HOURS_DEFAULT,
   SCAFFOLD_NEXT_SLOT,
   LAYER_WRITER_BASE,
   SCAFFOLD_CLASS_SLOT,
@@ -93,6 +99,25 @@ export interface Rotation {
  * boolean written here round-trips as 1/0. */
 export type AttributeValue = string | number | boolean;
 export type AttributeDict = Record<string, AttributeValue>;
+
+/** The location to stamp into the model's `ShadowInfo` record - see
+ * `SkpBuilder.setShadowInfoLocation`. */
+export interface ShadowInfoLocation {
+  /** City label shown in Model Info > Geo-location. Defaults to `""`,
+   * which is what SketchUp itself leaves for a coordinate pair with no
+   * place name. At most 254 characters. */
+  city?: string;
+  /** Country label, same field group. Defaults to `""`. At most 254
+   * characters. */
+  country?: string;
+  /** Degrees east, negative west. */
+  longitude: number;
+  /** Degrees north, negative south. */
+  latitude: number;
+  /** UTC offset in HOURS at standard (non-daylight-saving) time - 1 for
+   * Paris, -7 for Boulder. Defaults to 0. */
+  tzOffsetHours?: number;
+}
 
 /** Raised when a `.skp` file cannot be constructed. */
 export class SkpWriteError extends Error {
@@ -453,6 +478,23 @@ function f64Bytes(v: number): number[] {
 
 function u32Bytes(v: number): number[] {
   return [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff];
+}
+
+/** One UTF-16LE string record: the `ff fe ff` marker, a single length
+ * BYTE, then the characters. The one-byte length is the 255-character
+ * limit every caller reports.
+ *
+ * Shared with `ArchiveWriter.writeStr` so the records `toBytes()` splices
+ * straight into the document tail (`setShadowInfoLocation`) are encoded
+ * by the same code as every record written through a writer. */
+function encodeStr(s: string): number[] {
+  if (s.length >= 0xff) throw new SkpWriteError('string too long to encode (255 char limit)');
+  const out: number[] = [0xff, 0xfe, 0xff, s.length];
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    out.push(c & 0xff, (c >> 8) & 0xff);
+  }
+  return out;
 }
 
 function readU16(buf: number[], pos: number): number {
@@ -859,12 +901,7 @@ class ArchiveWriter {
   }
 
   private writeStr(s: string): void {
-    if (s.length >= 0xff) throw new SkpWriteError('string too long to encode (255 char limit)');
-    this.bytes.push(0xff, 0xfe, 0xff, s.length);
-    for (let i = 0; i < s.length; i++) {
-      const c = s.charCodeAt(i);
-      this.bytes.push(c & 0xff, (c >> 8) & 0xff);
-    }
+    this.bytes.append(encodeStr(s));
   }
 
   /** Write the first dimension/text's CSkFont record inline, or back-ref
@@ -1912,6 +1949,11 @@ export class SkpBuilder {
   /** Model-level attribute dictionaries, in call order - written as the
    * model's own `CAttributeContainer` by `toBytes()`. */
   private modelAttributeDicts: Array<[string, AttributeDict]> = [];
+  /** The model's `ShadowInfo` location, with every default resolved -
+   * spliced into the document tail by `toBytes()`. `undefined` until
+   * `setShadowInfoLocation` is called, and the tail is then left exactly
+   * as the scaffold has it. */
+  private shadowInfoLocation?: Required<ShadowInfoLocation>;
 
   private materialWriter: ArchiveWriter;
   /** Every material registered so far, by name - populated by
@@ -2007,6 +2049,76 @@ export class SkpBuilder {
     }
     this.materialWriter.nextSlot += 1; // this dictionary's
     this.modelAttributeDicts.push([dictName, { ...entries }]);
+  }
+
+  /**
+   * Set the location carried by the model's `ShadowInfo` record - what
+   * Model Info > Geo-location displays, and what the sun and shadow
+   * engine casts from.
+   *
+   * **This is the other half of geolocating a file.**
+   * `addModelAttributeDict('GeoReference', ...)` is what makes SketchUp
+   * report a file as accurately geo-located; it is NOT what the
+   * Geo-location dialog shows or what the shadows follow. Those come from
+   * here. Set only the dictionary and the file opens geo-located but
+   * showing - and shading for - the scaffold's inherited default, Boulder,
+   * Colorado. Both real fixtures this package bundles are in the mirror
+   * image of that state (re-geolocated to Boulder, `ShadowInfo` still
+   * naming the city they were authored in), which is what the two records
+   * disagreeing looks like in a file real SketchUp wrote.
+   *
+   * ```ts
+   * builder.setShadowInfoLocation({
+   *   city: 'Marseille',
+   *   country: 'France',
+   *   longitude: 5.3698,
+   *   latitude: 43.2965,
+   *   tzOffsetHours: 1,
+   * });
+   * ```
+   *
+   * Unlike `addModelAttributeDict` this may be called at any point before
+   * `toBytes()`, and calling it again replaces the previous value: the
+   * record lives in the document tail and costs no archive slots, so
+   * nothing about it can renumber a reference. Never calling it leaves
+   * the tail byte-for-byte as the scaffold has it.
+   */
+  setShadowInfoLocation(location: ShadowInfoLocation): void {
+    const city = location.city ?? '';
+    const country = location.country ?? '';
+    const { longitude, latitude } = location;
+    const tzOffsetHours = location.tzOffsetHours ?? 0;
+    for (const [label, value] of [['city', city], ['country', country]] as const) {
+      if (typeof value !== 'string') throw new SkpWriteError(`${label} must be a string`);
+      // One length byte per string record, so 254 characters is the most
+      // that can be encoded - the same limit every other name in the
+      // format carries.
+      if (value.length >= 0xff) {
+        throw new SkpWriteError(`${label} is too long to encode (255 character limit), got ${value.length}`);
+      }
+    }
+    for (const [label, value] of [
+      ['longitude', longitude],
+      ['latitude', latitude],
+      ['tzOffsetHours', tzOffsetHours],
+    ] as const) {
+      if (typeof value !== 'number' || !Number.isFinite(value)) {
+        throw new SkpWriteError(`${label} must be a finite number, got ${String(value)}`);
+      }
+    }
+    if (!(longitude >= -180 && longitude <= 180)) {
+      throw new SkpWriteError(`longitude must be between -180 and 180 degrees, got ${longitude}`);
+    }
+    if (!(latitude >= -90 && latitude <= 90)) {
+      throw new SkpWriteError(`latitude must be between -90 and 90 degrees, got ${latitude}`);
+    }
+    // Real UTC offsets run -12..+14; the symmetric bound is what
+    // legacy.ts's own reader accepts as a plausible record, so anything
+    // this writer let through past it would not read back.
+    if (!(tzOffsetHours >= -14 && tzOffsetHours <= 14)) {
+      throw new SkpWriteError(`tzOffsetHours must be between -14 and 14 hours, got ${tzOffsetHours}`);
+    }
+    this.shadowInfoLocation = { city, country, longitude, latitude, tzOffsetHours };
   }
 
   addMaterial(name: string, rgba: readonly number[], opacity?: number): number {
@@ -2604,24 +2716,33 @@ export class SkpBuilder {
 
     const tail = Array.from(this.data.subarray(this.tailPos));
     const totalTailShift = materialShift + layerShift + definitionShift + geometryShift;
-    // TAIL_REF_POSITIONS and ISO_CAMERA_TAIL_PATCHES's positions both
-    // index into this same tail buffer. A ref-shift that widens to the
-    // 6-byte escape form grows the buffer at that point, pushing every
-    // later position forward - so every action is applied in ascending
-    // original-offset order, tracking that growth.
+    // TAIL_REF_POSITIONS, ISO_CAMERA_TAIL_PATCHES's positions and the
+    // ShadowInfo record all index into this same tail buffer. Two of the
+    // three can change its LENGTH - a ref-shift that widens to the 6-byte
+    // escape form, and a ShadowInfo city/country of a different length
+    // than the scaffold's own - growing or shrinking the buffer at that
+    // point and moving every later position. So every action is applied
+    // in ascending original-offset order, tracking that growth. The
+    // ShadowInfo record sits at the very start of the tail, ahead of
+    // every ref and patch, so its own resize is what carries the rest.
     const isoPatches = new Map(ISO_CAMERA_TAIL_PATCHES);
-    const actions: Array<[number, 'ref' | 'patch']> = [
+    const actions: Array<[number, 'ref' | 'patch' | 'shadow']> = [
       ...TAIL_REF_POSITIONS.map((pos): [number, 'ref'] => [pos, 'ref']),
       ...Array.from(isoPatches.keys()).map((pos): [number, 'patch'] => [pos, 'patch']),
+      ...(this.shadowInfoLocation
+        ? [[SHADOW_INFO_CITY_POS - this.tailPos, 'shadow'] as [number, 'shadow']]
+        : []),
     ].sort((a, b) => a[0] - b[0]);
     let growth = 0;
     for (const [pos, kind] of actions) {
       const here = pos + growth;
       if (kind === 'ref') {
         growth += shiftRef(tail, here, totalTailShift);
-      } else {
+      } else if (kind === 'patch') {
         const patch = isoPatches.get(pos) as number[];
         for (let i = 0; i < patch.length; i++) tail[here + i] = patch[i];
+      } else {
+        growth += this.replaceShadowInfoLocation(tail, here);
       }
     }
     out.push(tail);
@@ -2634,6 +2755,49 @@ export class SkpBuilder {
       offset += part.length;
     }
     return result;
+  }
+
+  /**
+   * Replace the scaffold's `ShadowInfo` city/country/longitude/latitude/
+   * timezone in place, at `here` in the `tail` buffer. Returns the number
+   * of bytes the tail grew by (negative if it shrank), for the caller's
+   * ascending-order growth tracking.
+   *
+   * The guard is the whole point of doing it here rather than blind: the
+   * record's offset is a property of THIS scaffold's bytes, and the only
+   * way to tell that a swapped scaffold moved it is that the defaults it
+   * was derived against are no longer sitting there. Checking the two
+   * string records and the three doubles - not just the marker - is what
+   * makes an offset that has drifted by a few bytes fail loudly instead
+   * of splicing a new city over the middle of some other field.
+   */
+  private replaceShadowInfoLocation(tail: number[], here: number): number {
+    const loc = this.shadowInfoLocation as Required<ShadowInfoLocation>;
+    const expected = [
+      ...encodeStr(SHADOW_INFO_CITY_DEFAULT),
+      ...encodeStr(SHADOW_INFO_COUNTRY_DEFAULT),
+      ...f64Bytes(SHADOW_INFO_LONGITUDE_DEFAULT),
+      ...f64Bytes(SHADOW_INFO_LATITUDE_DEFAULT),
+      ...f64Bytes(SHADOW_INFO_TZ_OFFSET_HOURS_DEFAULT),
+    ];
+    for (let i = 0; i < expected.length; i++) {
+      if (tail[here + i] !== expected[i]) {
+        throw new SkpWriteError(
+          `scaffold does not carry SketchUp's default ShadowInfo location at byte ${SHADOW_INFO_CITY_POS} ` +
+            `(mismatch at +${i}) - SHADOW_INFO_CITY_POS and the SHADOW_INFO_*_DEFAULT values must be ` +
+            "re-derived before a ShadowInfo location can be written (see scaffold.ts's own docstring)"
+        );
+      }
+    }
+    const replacement = [
+      ...encodeStr(loc.city),
+      ...encodeStr(loc.country),
+      ...f64Bytes(loc.longitude),
+      ...f64Bytes(loc.latitude),
+      ...f64Bytes(loc.tzOffsetHours),
+    ];
+    tail.splice(here, expected.length, ...replacement);
+    return replacement.length - expected.length;
   }
 
   /** Write the finished file to `path` (Node.js only). */

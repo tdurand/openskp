@@ -159,6 +159,52 @@ export const ORIG_ROOT_COUNT = 0;
  * only `TAIL_REF_POSITIONS`/the ISO camera patches touched. */
 export const TAIL_POS = 3515;
 
+/** Absolute offset of the city string inside the scaffold's `ShadowInfo`
+ * record - the model's SECOND, independent copy of its location, and the
+ * one Model Info > Geo-location displays and the sun/shadow engine casts
+ * from (the `GeoReference` dictionary at `MODEL_ATTR_NULL_POS` is the
+ * other; a file needs both, see `SkpBuilder.setShadowInfoLocation`).
+ *
+ * The record starts at `TAIL_POS` itself - it is the first thing in the
+ * document tail, directly after the root entity list - and this offset is
+ * 14 bytes past that, one header's worth:
+ *
+ * ```text
+ * 3515  00 x9, u32 ShadowTime (a Unix time_t), 00      14-byte header
+ * 3529  ff fe ff 0c "Boulder (CO)" (UTF-16LE)          City
+ * 3557  ff fe ff 03 "USA"                              Country
+ * 3567  f64 -105.283                                   Longitude
+ * 3575  f64 40.017                                     Latitude
+ * 3583  f64 -7                                         UTC offset, HOURS
+ * 3591  f64 0, 3599: f64 1.0, then the rest of the     (not decoded)
+ *       Shadows panel, then at 3823 the CSkFont class
+ * ```
+ *
+ * Boulder, Colorado is SketchUp's own default location, not a choice this
+ * project made - every blank document it writes carries it. That is why
+ * this offset exists: a file geolocated by the `GeoReference` dictionary
+ * alone still opens showing Boulder and casting Boulder's shadows.
+ *
+ * `legacy.ts`'s `readShadowInfo` finds the same record generically (at
+ * whatever offset the walk's own root-entity list happens to end), and is
+ * what verified this layout across all four bundled legacy files - two
+ * versions, two writers, four different offsets. This constant is only
+ * the scaffold's own, for the writer to splice at.
+ *
+ * The three fields at `SHADOW_INFO_*_DEFAULT` below are the values that
+ * must be found here; the writer checks them before replacing anything,
+ * so a swapped scaffold fails loudly instead of corrupting the tail. */
+export const SHADOW_INFO_CITY_POS = 3529;
+
+/** The scaffold's own `ShadowInfo` values - SketchUp's defaults, and the
+ * writer's guard that `SHADOW_INFO_CITY_POS` still points where it was
+ * derived. */
+export const SHADOW_INFO_CITY_DEFAULT = 'Boulder (CO)';
+export const SHADOW_INFO_COUNTRY_DEFAULT = 'USA';
+export const SHADOW_INFO_LONGITUDE_DEFAULT = -105.283;
+export const SHADOW_INFO_LATITUDE_DEFAULT = 40.017;
+export const SHADOW_INFO_TZ_OFFSET_HOURS_DEFAULT = -7;
+
 /** The next free archive slot after parsing through the scaffold's own
  * material section (absent) + layer list (Layer0) + definition-list
  * anchor - i.e. where a material/layer/definition/geometry writer with

@@ -69,6 +69,7 @@ export type {
   Rotation,
   AttributeValue,
   AttributeDict,
+  ShadowInfoLocation,
   AddFaceOptions,
   AddCircleOptions,
   AddArcOptions,
@@ -326,6 +327,11 @@ function parseToRaw(buffer: ArrayBuffer, options?: ParseOptions): ParsedRawData 
     // container. VFF files keep the same information somewhere in the TLV
     // tree, not yet located, so they report none rather than guessing.
     attributes: {},
+    // Same story for the model's ShadowInfo location - a legacy
+    // (MFC-archive) record, read there off the walk's own stopping
+    // position. VFF files keep the equivalent somewhere in the TLV tree,
+    // not yet located.
+    shadowInfo: null,
     units,
     layerColors,
     layerHidden,

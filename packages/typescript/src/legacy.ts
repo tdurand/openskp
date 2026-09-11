@@ -18,7 +18,7 @@
 import { GeometryBuilderFace, GeometryBuilderInstance, ParsedDefinition } from './geometry';
 import { EdgeFlagStore } from './edge-flags';
 import { DefaultVertexStore, type VertexStore } from './vertex-store';
-import { Material, Texture, ParsedRawData, ModelAttributes, ModelAttributeValue } from './model';
+import { Material, Texture, ParsedRawData, ModelAttributes, ModelAttributeValue, ShadowInfo } from './model';
 import { SkpParseError } from './errors';
 import { ParseOptions, PROGRESS_INTERVAL, emitLog, emitProgress } from './observability';
 
@@ -1521,6 +1521,97 @@ function readModelAttributes(data: Uint8Array, ver: number, matCountPos: number)
   return found ?? {};
 }
 
+/**
+ * Bytes of undecoded `ShadowInfo` header ahead of the city string: nine
+ * zero bytes, a u32 `ShadowTime` (SketchUp's shadow clock, a Unix
+ * `time_t`), then one more zero byte.
+ *
+ * The time_t is the only non-zero field, and its VALUE is not part of the
+ * anchor - the four legacy files this package bundles carry four
+ * different ones (two SDK-written files share 2026-06-21 13:30 UTC,
+ * SketchUp's default "June 21, 1:30 PM"; the two real ones carry
+ * whenever their author last touched the shadow settings). Only the
+ * zero-run shape around it is. See `scaffold.ts`'s
+ * `SHADOW_INFO_CITY_POS`, which pins the write side of the same layout.
+ */
+const SHADOW_INFO_HEADER_LEN = 14;
+
+/** Read one `ff fe ff <len>` UTF-16LE string record at `pos`, or null if
+ * the marker is not there / the record runs past the end. */
+function readStrRecordAt(data: Uint8Array, pos: number): { value: string; end: number } | null {
+  if (pos + 4 > data.length) return null;
+  if (data[pos] !== 0xff || data[pos + 1] !== 0xfe || data[pos + 2] !== 0xff) return null;
+  const n = data[pos + 3];
+  const end = pos + 4 + n * 2;
+  if (end > data.length) return null;
+  let value = '';
+  for (let i = 0; i < n; i++) {
+    value += String.fromCharCode(data[pos + 4 + i * 2] | (data[pos + 5 + i * 2] << 8));
+  }
+  return { value, end };
+}
+
+/**
+ * Decode the model's `ShadowInfo` location - the city/country/longitude/
+ * latitude/timezone Model Info > Geo-location displays and the sun and
+ * shadow engine casts from.
+ *
+ * **Why this is separate from `readModelAttributes`.** A geolocated file
+ * carries the SAME location twice, in two unrelated records: the
+ * `GeoReference` attribute dictionary on the model's own attribute
+ * container (which is what makes SketchUp call a file "accurately
+ * geo-located"), and this one. Setting only the first leaves the dialog
+ * and the shadows on whatever the file had before - which is exactly the
+ * state both real fixtures here are in: re-geolocated to Boulder with Set
+ * Manual Location, `ShadowInfo` still naming Barcelona and Brasilia.
+ *
+ * **Where the record is.** Directly after the root entity list, i.e. at
+ * the first byte of the undecoded document tail - `walk()`'s own stopping
+ * position, passed in as `tailPos`. That is the anchor: not a byte
+ * pattern search, not the scaffold's own offset. Verified against all
+ * four legacy files this package bundles (`blank_v17`,
+ * `single_material_v17`, `capilla_quiroz_v17`, `gondola_v20`), whose
+ * records sit at four different offsets in files of very different sizes
+ * and two different versions.
+ *
+ * The record itself is `SHADOW_INFO_HEADER_LEN` header bytes, then the
+ * city and country as UTF-16 string records, then three f64s: longitude,
+ * latitude, and the timezone's UTC offset in hours. (More f64 fields
+ * follow - dark/light, sun-for-shading and the rest of the Shadows
+ * panel - none of them decoded here.)
+ *
+ * Best-effort, like `readModelAttributes`: a file whose tail does not
+ * start with this shape reports `null` rather than failing a parse that
+ * has already recovered the whole model.
+ */
+function readShadowInfo(data: Uint8Array, tailPos: number): ShadowInfo | null {
+  const cityPos = tailPos + SHADOW_INFO_HEADER_LEN;
+  if (cityPos > data.length) return null;
+  // The header's zero run, around the one live field (the time_t).
+  for (let i = 0; i < 9; i++) {
+    if (data[tailPos + i] !== 0) return null;
+  }
+  if (data[tailPos + 13] !== 0) return null;
+
+  const city = readStrRecordAt(data, cityPos);
+  if (city === null) return null;
+  const country = readStrRecordAt(data, city.end);
+  if (country === null) return null;
+  if (country.end + 24 > data.length) return null;
+
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const longitude = view.getFloat64(country.end, true);
+  const latitude = view.getFloat64(country.end + 8, true);
+  const tzOffsetHours = view.getFloat64(country.end + 16, true);
+  // Range check as a decode check: three plausible angles in a row is
+  // what says the header shape above landed on a real record rather than
+  // on a tail that happens to start with zeros.
+  if (!(Math.abs(longitude) <= 180) || !(Math.abs(latitude) <= 90) || !(Math.abs(tzOffsetHours) <= 14)) {
+    return null;
+  }
+  return { city: city.value, country: country.value, longitude, latitude, tzOffsetHours };
+}
+
 function findVersionMajor(data: Uint8Array): number | null {
   const head = data.subarray(0, Math.min(0x60, data.length));
   // strip all 0x00 bytes (UTF-16LE ASCII text becomes plain ASCII-like)
@@ -1545,6 +1636,11 @@ interface WalkResult {
    * ahead of that anchor. */
   ver: number;
   matCountPos: number;
+  /** The absolute offset the walk stopped at - one past the last root
+   * entity, i.e. the first byte of the undecoded document tail. The
+   * model's `ShadowInfo` record starts exactly there; see
+   * `readShadowInfo`. */
+  tailPos: number;
 }
 
 /** Bootstrap the absolute slot base: parse material 1 with a throwaway
@@ -1741,7 +1837,7 @@ function walkModel(data: Uint8Array, ver: number, start: number, matCount: numbe
   // matCountPos: the count is always the 4 bytes right before the
   // anchor, whether that anchor is the first CMaterial record or (for a
   // zero-material file) the layer-list marker.
-  return { ar, root, layers, materials, ver, matCountPos: start - 4 };
+  return { ar, root, layers, materials, ver, matCountPos: start - 4, tailPos: r.pos };
 }
 
 // ── adapter to the shared ParsedRawData shape ───────────────────────────
@@ -1932,6 +2028,7 @@ export function parseLegacyToRaw(data: Uint8Array, options?: ParseOptions): Pars
   }
 
   const attributes = readModelAttributes(data, walkResult.ver, walkResult.matCountPos);
+  const shadowInfo = readShadowInfo(data, walkResult.tailPos);
 
   const { ar, root, layers, materials } = walkResult;
   const slots = ar.slots;
@@ -2057,6 +2154,7 @@ export function parseLegacyToRaw(data: Uint8Array, options?: ParseOptions): Pars
   return {
     version,
     attributes,
+    shadowInfo,
     // Legacy (pre-2021 MFC) files carry no meta/meta.dat container -
     // that's a VFF/ZIP-only construct - so there is no known source for
     // the model's unit-system string here.
