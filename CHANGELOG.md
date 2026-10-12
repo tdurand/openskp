@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — TypeScript writer: large files no longer run a browser tab out of memory
+
+A real ~1 GB export (a 4.6 x 3.5 km city: terrain, buildings, roads, land cover)
+failed in the browser with "Array buffer allocation failed" in
+`GrowableBytes.reserve`. The writer held about three times the file's size:
+
+- The archive buffer doubled on demand, so a 1 GB archive asked for a fresh 2 GB
+  block while the 1 GB it was copying from was still alive. `GrowableBytes` is now
+  a list of chunks (doubling from 64 KB up to 16 MB, never copied); the archive
+  costs its own length plus at most one chunk of slack. `patchU32` replaces the
+  writers' direct `writeU32At(bytes.buf, ...)` so a count can still be patched
+  into an earlier, sealed chunk.
+- A closed group's vertex and edge lookup tables stayed referenced from
+  `pendingGroups` until `toBytes()`. `_close()` now clears them.
+- `toBytes()` joined everything into one more contiguous copy. The new
+  `SkpBuilder.toParts()` returns the same file as ordered slices
+  (`{ bytes, scaffold }`), ready for `new Blob(...)` without a joined copy;
+  `toBytes()` is now `toParts()` joined, byte for byte the same output.
+
+On a synthetic 1M-triangle terrain plus 50k polylines (208 MB file), the JS heap
+retained after the terrain group drops from 382 MB to 127 MB, and the archive
+never asks for more than one 16 MB chunk at a time (a single larger write, such
+as a big texture, gets a chunk of its own size).
+
 ### Changed — tests: the legacy v3 / v7 / 2014 fixtures shrink from 1.6 MB to 8-12 KB and drop SketchUp's default-template images
 
 The three fixtures added with the pre-2014 fixes were real SketchUp saves, so each

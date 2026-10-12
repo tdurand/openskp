@@ -85,6 +85,13 @@ export interface Rotation {
 export type AttributeValue = string | number;
 export type AttributeDict = Record<string, AttributeValue>;
 
+/** One slice of a finished file, see `SkpBuilder.toParts()`. */
+export interface FilePart {
+  bytes: Uint8Array;
+  /** True for the blank document's own bytes, false for the model archive. */
+  scaffold: boolean;
+}
+
 /** Raised when a `.skp` file cannot be constructed. */
 export class SkpWriteError extends Error {
   constructor(message: string) {
@@ -387,10 +394,18 @@ function uvMatrixForFace(points: readonly Point3[], pairs: readonly UvPair[], no
 
 /**
  * Growable byte buffer for the archive writers. A plain `number[]` costs
- * about 9 bytes of heap per file byte (one boxed element each) and
- * `toBytes()` then copied the whole archive twice more, so a 60 MB write
- * needed ~1.7 GB of transient heap. A `Uint8Array` that doubles on demand
- * keeps it at file size, with identical output.
+ * about 9 bytes of heap per file byte (one boxed element each), so the
+ * archive lives in typed arrays.
+ *
+ * It is a list of chunks rather than one array that doubles: doubling a
+ * 1 GB archive asks the engine for a fresh 2 GB block while the 1 GB it
+ * copies from is still alive, which is where a city-sized export runs a
+ * browser tab out of memory ("Array buffer allocation failed"). Chunks
+ * start at `capacity`, double up to `GROWABLE_MAX_CHUNK` and are never
+ * copied, so the archive costs its own length plus at most one chunk of
+ * slack. A chunk is sealed when the next write does not fit in it, so
+ * every `push()` / `append()` lands in ONE chunk; `patchU32` can still
+ * straddle two, and goes byte by byte.
  *
  * `push(...values)` is for the record writers' few-byte writes (a u32, an
  * f64, a string header). Whole buffers go through `append`: spreading a
@@ -398,36 +413,77 @@ function uvMatrixForFace(points: readonly Point3[], pairs: readonly UvPair[], no
  * engine-dependent), the real bug the old `appendAll` loop existed to
  * avoid when `toBytes()` spliced multi-hundred-KB buffers together.
  */
+const GROWABLE_MAX_CHUNK = 1 << 24;
+
 class GrowableBytes {
-  buf: Uint8Array;
+  /** Total bytes written, across every chunk. */
   length = 0;
+  private chunks: Uint8Array[] = [];
+  private starts: number[] = [];
+  private buf: Uint8Array;
+  private bufStart = 0;
   constructor(capacity = 1 << 16) {
     this.buf = new Uint8Array(capacity);
   }
   private reserve(extra: number): void {
-    const needed = this.length + extra;
-    if (needed <= this.buf.length) return;
-    let capacity = this.buf.length * 2;
-    while (capacity < needed) capacity *= 2;
-    const next = new Uint8Array(capacity);
-    next.set(this.buf.subarray(0, this.length));
-    this.buf = next;
+    const used = this.length - this.bufStart;
+    if (used + extra <= this.buf.length) return;
+    if (used > 0) {
+      this.chunks.push(this.buf.subarray(0, used));
+      this.starts.push(this.bufStart);
+    }
+    this.bufStart = this.length;
+    const size = Math.min(this.buf.length * 2, GROWABLE_MAX_CHUNK);
+    this.buf = new Uint8Array(Math.max(size, extra));
   }
   push(...values: number[]): void {
     this.reserve(values.length);
     const buf = this.buf;
-    let n = this.length;
+    let n = this.length - this.bufStart;
     for (let i = 0; i < values.length; i++) buf[n++] = values[i];
-    this.length = n;
+    this.length += values.length;
   }
   append(src: ArrayLike<number>): void {
     this.reserve(src.length);
-    this.buf.set(src instanceof Uint8Array ? src : Uint8Array.from(src), this.length);
+    this.buf.set(src instanceof Uint8Array ? src : Uint8Array.from(src), this.length - this.bufStart);
     this.length += src.length;
   }
-  /** The bytes written so far, without copying. */
+  /** Overwrite the already-written byte at absolute position `pos`. */
+  private setAt(pos: number, v: number): void {
+    if (pos >= this.bufStart) {
+      this.buf[pos - this.bufStart] = v;
+      return;
+    }
+    let lo = 0;
+    let hi = this.starts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (this.starts[mid] <= pos) lo = mid;
+      else hi = mid - 1;
+    }
+    this.chunks[lo][pos - this.starts[lo]] = v;
+  }
+  /** Overwrite the already-written little-endian u32 at `pos`. */
+  patchU32(pos: number, v: number): void {
+    const b = u32Bytes(v);
+    for (let i = 0; i < 4; i++) this.setAt(pos + i, b[i]);
+  }
+  /** The bytes written so far, in order, without copying. */
+  parts(): Uint8Array[] {
+    const used = this.length - this.bufStart;
+    return used > 0 ? [...this.chunks, this.buf.subarray(0, used)] : this.chunks.slice();
+  }
+  /** The bytes written so far in one array (copies when chunked). */
   view(): Uint8Array {
-    return this.buf.subarray(0, this.length);
+    const parts = this.parts();
+    if (parts.length === 1) return parts[0];
+    const out = new Uint8Array(this.length);
+    let offset = 0;
+    for (const part of parts) {
+      out.set(part, offset);
+      offset += part.length;
+    }
+    return out;
   }
 }
 
@@ -597,7 +653,7 @@ class ArchiveWriter {
   }
 
   private patchU32(pos: number, v: number): void {
-    writeU32At(this.bytes.buf, pos, v);
+    this.bytes.patchU32(pos, v);
   }
 
   newOfKnownClass(className: string, schema?: number): number {
@@ -1834,6 +1890,12 @@ export class ComponentDefinitionBuilder {
     this._skp._patchDefinitionCount(this.countPatchPos, this.newEntityCount);
     writer.writeDefinitionTail(this.name);
     this.closed = true;
+    // A closed definition takes no more geometry (checkWritable), but a
+    // group's stays referenced from pendingGroups until toBytes(), and with
+    // it every vertex and edge key it ever wrote: a large terrain group's
+    // lookup tables would otherwise outlive it for the rest of the export.
+    this.vertexSlots.clear();
+    this.edgeRegistry.clear();
     this._skp._clearOpenDefinition();
     if (this.groupPlacement !== undefined) {
       // Deferred rather than written here - see SkpBuilder._ensureGeometryWriter.
@@ -2375,6 +2437,29 @@ export class SkpBuilder {
 
   /** Return the finished file's bytes. */
   toBytes(): Uint8Array {
+    const parts = this.toParts();
+    let total = 0;
+    for (const part of parts) total += part.bytes.length;
+    const result = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) {
+      result.set(part.bytes, offset);
+      offset += part.bytes.length;
+    }
+    return result;
+  }
+
+  /**
+   * The finished file as an ordered list of slices, without joining them
+   * into one array: `new Blob(parts.map((p) => p.bytes))` writes the same
+   * file as `toBytes()` with no contiguous copy of it, which matters once
+   * an export runs to hundreds of megabytes. `scaffold` is true for the
+   * blank document's own bytes (with the counts and anchors spliced into
+   * them), false for the archive the writers produced from the model, so
+   * a caller that post-processes document records (camera, options, style)
+   * can search just those.
+   */
+  toParts(): FilePart[] {
     if (this.pendingGroups.length > 0) {
       // A file with only groups (no addFace/addInstance call) would
       // otherwise never flush them.
@@ -2391,10 +2476,13 @@ export class SkpBuilder {
 
     // Collect the archive's pieces and assemble them into one exact-size
     // buffer at the end: no intermediate number[] of the whole file.
-    const parts: Uint8Array[] = [];
+    const parts: FilePart[] = [];
     const out = {
       push: (part: ArrayLike<number>) => {
-        parts.push(part instanceof Uint8Array ? part : Uint8Array.from(part));
+        parts.push({ bytes: part instanceof Uint8Array ? part : Uint8Array.from(part), scaffold: true });
+      },
+      pushAll: (bytes: GrowableBytes) => {
+        for (const part of bytes.parts()) parts.push({ bytes: part, scaffold: false });
       },
     };
 
@@ -2416,7 +2504,7 @@ export class SkpBuilder {
     }
     out.push(prefix);
     out.push(u32Bytes(this.materialCount));
-    out.push(this.materialWriter.bytes.view());
+    out.pushAll(this.materialWriter.bytes);
 
     // materialInsertPos -> layerInsertPos: Layer0 (and any other already-
     // existing layers) plus the layer_count field, unmodified except for
@@ -2425,7 +2513,7 @@ export class SkpBuilder {
     const layerCountRel = this.layerCountPos - this.materialInsertPos;
     writeU32At(middle1, layerCountRel, this.origLayerCount + this.layerCount);
     out.push(middle1);
-    if (this.layerWriter !== null) out.push(this.layerWriter.bytes.view());
+    if (this.layerWriter !== null) out.pushAll(this.layerWriter.bytes);
 
     // layerInsertPos -> defCountPos: just the active-layer anchor, which
     // needs +materialShift (never +layerShift - Layer0 itself never moves
@@ -2435,7 +2523,7 @@ export class SkpBuilder {
     out.push(middle2a);
 
     out.push(u32Bytes(this.origDefCount + this.definitionCount));
-    if (this.definitionWriterInstance !== null) out.push(this.definitionWriterInstance.bytes.view());
+    if (this.definitionWriterInstance !== null) out.pushAll(this.definitionWriterInstance.bytes);
 
     // defCountPos+4 -> rootCountPos: any already-existing definitions
     // (none, in the blank scaffold), unmodified.
@@ -2443,7 +2531,7 @@ export class SkpBuilder {
 
     out.push(u32Bytes(newRootCount));
     out.push(this.data.subarray(this.rootCountPos + 4, this.tailPos));
-    out.push((this.geometryWriter as ArchiveWriter).bytes.view());
+    out.pushAll((this.geometryWriter as ArchiveWriter).bytes);
 
     const tail = Array.from(this.data.subarray(this.tailPos));
     const totalTailShift = materialShift + layerShift + definitionShift + geometryShift;
@@ -2468,15 +2556,7 @@ export class SkpBuilder {
       }
     }
     out.push(tail);
-    let total = 0;
-    for (const part of parts) total += part.length;
-    const result = new Uint8Array(total);
-    let offset = 0;
-    for (const part of parts) {
-      result.set(part, offset);
-      offset += part.length;
-    }
-    return result;
+    return parts;
   }
 
   /** Write the finished file to `path` (Node.js only). */
@@ -2498,7 +2578,7 @@ export class SkpBuilder {
   /** @internal */
   _patchDefinitionCount(countPatchPos: number, count: number): void {
     const writer = this.definitionWriterInstance as ArchiveWriter;
-    writeU32At(writer.bytes.buf, countPatchPos, count);
+    writer.bytes.patchU32(countPatchPos, count);
   }
 
   /** @internal */
